@@ -19,3 +19,7 @@ https://dataverse.nl/dataset.xhtml?persistentId=doi%3A10.34894%2FZ7ZVOD&version=
 In Models.py there is also the implementatin of EEGNet (http://iopscience.iop.org/article/10.1088/1741-2552/aace8c/meta).
 
 After the steps before you can Run EEGNet_default_loto.py for the comparision test using EEGNet with default parameters or PreProc_EEGNet_temporal_loto_Generalized.py for the comparision test using EGGNet using data from different subjects.
+
+# Utility code
+
+In addition to the code for the models and the examples of usege there is a further code (count_FLOPs.py) that is used to count the number of FLOPs and show the summary of the model with an indication of the number of parameters used. In order to use this code, you must have trained the model about which you want to know this information. The saved model should then be in the 'saved_model' folder. Modify the path of the model you want to load in the code, change the size of the sample input data to fit the model and finally just run the code.
