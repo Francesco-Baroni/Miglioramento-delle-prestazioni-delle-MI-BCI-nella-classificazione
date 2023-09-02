@@ -1,0 +1,314 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# import libraries
+
+import os
+from os import listdir
+import pandas as pd
+import numpy as np
+import time
+from tensorflow.keras.utils import to_categorical
+import tensorflow as tf
+from matplotlib import pyplot as plt
+from sklearn.metrics import classification_report
+from sklearn.model_selection import LeaveOneGroupOut
+from Models import ProposedCNN
+
+from sklearn.base import BaseEstimator, TransformerMixin
+
+from scipy.signal import butter, lfilter
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+#UNWANTED_COLS = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz', 'CP1', 'CP2'] #kept ['FC5', 'FC6', 'C3', 'C4', 'CP5', 'CP6', 'T7', 'T8']
+UNWANTED_COLS = ['F3', 'Fz', 'F4', 'FC1', 'FC5', 'FC2', 'FC6', 'CP1', 'CP5', 'CP2', 'CP6', 'T7', 'T8'] #kept ['C3', 'Cz', 'C4']
+# all: F3, Fz, F4, FC1, FC5, FC2, FC6, C3, Cz, C4, CP1, CP5, CP2, CP6, T7, T8
+
+
+# all subjects csv files folder
+
+DATA_FOLDER = "output_trial"
+
+# subject wise performance result csv
+
+SUBJECT_WISE_PERFORMANCE_METRIC_CSV = "PreProc_CNN_3D_temporal_loto_subject_performance_metric.csv"
+
+# list all the subject wise csv files
+
+def find_csv_filenames(path_to_dir, suffix=".csv"):
+    filenames = listdir(path_to_dir)
+    return [os.path.join(path_to_dir, filename) for filename in filenames if filename.endswith(suffix)]
+
+
+# load dataframe from csv
+
+def load_data(filename):
+    # read csv file
+    df = pd.read_csv(filename)
+    return df
+
+def class_scores(y_true, y_pred, reference):
+    
+    """Function which takes two lists and a reference indicating which class
+    to calculate the TP, FP, and FN for."""
+    
+    # .................................................................
+    Y_true = set([i for (i, v) in enumerate(y_true) if v == reference])
+    # print("Y_true:{}".format(Y_true))
+    Y_pred = set([i for (i, v) in enumerate(y_pred) if v == reference])
+    # print("Y_pred:{}".format(Y_pred))
+    TP = len(Y_true.intersection(Y_pred))
+    # print(TP)
+    FP = len(Y_pred - Y_true)
+    FN = len(Y_true - Y_pred)
+    return TP, FP, FN
+
+
+def f_beta_score(precision, recall, beta=1):
+    """A function which takes the precision and recall of some model, and a value for beta,
+    and returns the f_beta-score"""
+    #.......................................................................
+    return (1+beta**2) * precision * recall / (beta**2 * precision + recall)
+
+
+def f_score(precision, recall):
+    return f_beta_score(precision, recall, beta=1)
+
+filters = 6
+class FilterBank(BaseEstimator, TransformerMixin):
+
+# obtained from https://www.kaggle.com/eilbeigi/visual/data
+# author: fornax, alexandre
+
+    """Filterbank TransformerMixin.
+    Return signal processed by a bank of butterworth filters.
+    """
+
+    def __init__(self, filters='LowpassBank'):
+        """init."""
+        if filters == 'LowpassBank':
+            #self.freqs_pairs = [[0.5], [1], [2], [3], [4], [5], [7], [9], [15], [30]]
+            self.freqs_pairs = [[0.5], [4], [4, 7], [8, 12], [12, 30], [0.5, 30]] 
+        else:
+            self.freqs_pairs = filters
+        self.filters = filters
+
+    def fit(self, X, y=None):
+        """Fit Method, Not used."""
+        return self
+
+    def transform(self, X, y=None):
+        """Transform. Apply filters."""
+        X_tot = []
+        for freqs in self.freqs_pairs:
+            if len(freqs) == 1:
+                b, a = butter(5, freqs[0] / 250.0, btype='lowpass')
+            else:
+                if freqs[1] - freqs[0] < 3:
+                    b, a = butter(3, np.array(freqs) / 250.0, btype='bandpass')
+                else:
+                    b, a = butter(5, np.array(freqs) / 250.0, btype='bandpass')
+            X_filtered = lfilter(b, a, X, axis=0)
+            X_tot.append(X_filtered)
+
+        return np.array(X_tot)
+
+def preprocessData(data):
+    """Preprocess data with filterbank."""
+    fb = FilterBank()
+    return fb.transform(data)
+
+def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
+    """
+    Call in a loop to create terminal progress bar
+    @params:
+        iteration   - Required  : current iteration (Int)
+        total       - Required  : total iterations (Int)
+        prefix      - Optional  : prefix string (Str)
+        suffix      - Optional  : suffix string (Str)
+        decimals    - Optional  : positive number of decimals in percent complete (Int)
+        length      - Optional  : character length of bar (Int)
+        fill        - Optional  : bar fill character (Str)
+        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
+    """
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
+    # Print New Line on Complete
+    if iteration == total: 
+        print()
+
+def multi_data_trial(df, channels):
+    #Version: 1.0 a
+    x = []
+    y = []
+    
+    groups = df.groupby('trial')
+    
+    for i, group in groups:
+        group = group.drop(['trial'], axis=1)
+        y_trial = group.pop("class").head(1)
+        group_processed = preprocessData(group.to_numpy())
+        x.append(group_processed.transpose().reshape(channels, len(group), filters, 1))
+        y.append(y_trial)
+        
+    x = np.array(x)
+    return x, y
+
+def scheduler(epoch, lr):
+    if epoch < 100:
+        return lr
+    return lr * tf.math.exp(-0.01)
+
+def train_model(filename, unified_dataset=pd.DataFrame()):
+    extracted_filename = os.path.basename(filename)
+    
+    # split the filename by first underscore
+    lhs, rhs = extracted_filename.split("_", 1)
+
+    df = load_data(filename)
+    df.drop(UNWANTED_COLS, axis=1, inplace=True, errors='ignore')
+
+    X = []
+    y = []
+    samples = 1001
+    channels = 3
+
+    for i in range(3):
+        min_trial = df['trial'].min()
+        
+        df['trial'] = df['trial']-min_trial+1
+
+        lower_bound = i * 40 + 1
+        upper_bound = (i + 1) * 40
+        
+        x = df[(df['trial'] >= lower_bound) & (df['trial'] <= upper_bound)].copy()
+
+        # temporal data
+        x, y_tmp = multi_data_trial(x, channels=channels)
+
+        X.append(x)
+        y.append(y_tmp)
+
+    X = np.array(X)
+    y = np.array(y)
+
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
+
+    groups = np.array(range(X.shape[0]))
+    logo = LeaveOneGroupOut()
+    print(logo.get_n_splits(X, y, groups))
+
+    merged_subjects_df = pd.DataFrame()
+
+    for i, (train_index, test_index) in enumerate(logo.split(X, y, groups)):
+        print(f"Fold {i}:")
+        #print(f"  Train: index={train_index}, group={groups[train_index]}")
+        #print(f"  Test:  index={test_index}, group={groups[test_index]}")
+        x_train=np.concatenate(np.array([X[ii] for ii in train_index]))
+        y_train=np.concatenate(np.array([y[ii] for ii in train_index]))
+
+        x_test=np.concatenate(np.array([X[ii] for ii in test_index]))
+        y_test=np.concatenate(np.array([y[ii] for ii in test_index]))
+
+        # some parameters
+        batch_size = 16
+        num_classes = 2
+        epochs = 200
+
+        print('x_train shape:', x_train.shape)
+        print('y_train shape:', y_train.shape)
+
+        y_train = to_categorical(y_train)
+        y_test = to_categorical(y_test)
+
+        model = ProposedCNN(2, channels, samples, filters, kernLength=63, F1=4, F2=8,  dropoutRate=0.5, dropoutType="Dropout")
+        model.summary()
+
+        opt = tf.keras.optimizers.Adam()
+
+        model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
+        callback = tf.keras.callbacks.LearningRateScheduler(scheduler)
+        print("==========",lhs,"==========")
+
+        st = time.time()
+        # train the model
+        history = model.fit(x_train, y_train,
+                            batch_size=batch_size,
+                            epochs=epochs,
+                            validation_data=(x_test, y_test),
+                            callbacks=[callback],
+                            shuffle=False,
+                            )
+        
+        et = time.time()
+        train_time = et-st
+        print("Train time:", train_time, "seconds")
+
+        # save the model
+        model.save('saved_model/CNN3D_3ele')
+
+        # history plot for accuracy and loss
+        plt.figure(figsize=(10, 10))
+        plt.subplot(2, 1, 1)
+        plt.plot(history.history['accuracy'])
+        plt.plot(history.history['val_accuracy'])
+        plt.title('Accuracy')
+        plt.ylabel('accuracy')
+        plt.xlabel('epoch')
+        plt.legend(['train', 'test'], loc='upper left')
+
+        plt.subplot(2, 1, 2)
+        plt.plot(history.history['loss'])
+        plt.plot(history.history['val_loss'])
+        plt.title('Loss')
+        plt.ylabel('loss')
+        plt.xlabel('epoch')
+        plt.legend(['train', 'test'], loc='upper left')
+
+        plt.suptitle('PreProc_CNN_3D_3ele_Temporal Performance {} loto {}'.format(lhs, test_index[0]))
+        plt.tight_layout()
+        plt.savefig('graphs/PreProc_CNN_3D_ele_Temporal Performance {} loto {}.png'.format(lhs, test_index[0]))
+        plt.clf()
+        # plt.show()
+
+        # convert them to single-digit ones
+        predictions = model.predict(x_test)
+
+        report = classification_report(y_test, predictions.round(),  output_dict=True)
+        df_report = pd.DataFrame(report).transpose()
+        df_report.to_csv(f"reports_csv/{lhs}_{test_index[0]}.csv")
+
+        print(history.history['accuracy'][-1], history.history['val_accuracy'][-1], history.history['loss'][-1], history.history['val_loss'][-1])
+
+        subject_id, acc, val_acc, loss, val_loss, trial_out = lhs, history.history['accuracy'][-1], history.history['val_accuracy'][-1], history.history['loss'][-1], history.history['val_loss'][-1], test_index[0]
+
+        subject_dic = pd.DataFrame(
+            [(subject_id, acc, val_acc, loss, val_loss, trial_out)],
+            columns=['subject_id', 'train_acc', 'test_acc', 'train_loss', 'test_loss', 'trial_out'])
+        merged_subjects_df = pd.concat([merged_subjects_df, subject_dic], ignore_index=True)
+        
+
+    return merged_subjects_df
+
+
+if __name__ == '__main__':
+    subject_filenames = find_csv_filenames(DATA_FOLDER)
+
+    # new dataframe for performance metrics
+    merged_subjects_df = pd.DataFrame()
+
+    st = time.time()
+    # train a model for each subject
+    for name in subject_filenames:
+        subjects_dic = train_model(name)
+
+        merged_subjects_df = pd.concat([merged_subjects_df, subjects_dic], ignore_index=True)
+
+    et = time.time()
+    print("All train time:", et-st, "seconds")
+    # write into csv file
+    merged_subjects_df.to_csv(SUBJECT_WISE_PERFORMANCE_METRIC_CSV, index=True)
